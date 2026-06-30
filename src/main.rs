@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
-use clap::{ArgAction, ArgGroup, Parser};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use clap::{ArgAction, ArgGroup, Parser};
 use dirs::cache_dir;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -9,40 +9,63 @@ use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 #[command(
-    name="CoinEx",
+    name = "CoinEx",
     version,
-    about="即時加密貨幣↔法幣、幣↔幣換算 (CoinGecko API)",
-    // 來源必須二選一：--crypto 或 --fiat
-    group = ArgGroup::new("src").required(true).args(&["crypto","fiat"]),
-    // 目標必須二選一：--to-crypto 或 --to-fiat
-    group = ArgGroup::new("dst").required(true).args(&["to-crypto","to-fiat"])
+    about = "Real-time crypto↔fiat and crypto↔crypto conversion tool",
+    long_about = "CoinEx uses the CoinGecko API to look up current prices and convert between cryptocurrencies, fiat currencies, and CoinGecko quote currencies.
+
+Each run must specify one source (--crypto or --fiat) and one destination (--to-crypto or --to-fiat). Cryptocurrency values may be CoinGecko coin ids, symbols, or names. Fiat / quote currencies must use CoinGecko supported_vs_currencies codes such as usd, eur, twd, btc, or eth.",
+    after_help = "Examples:
+  CoinEx --crypto bitcoin 0.01 --to-fiat twd
+  CoinEx --fiat usd 100 --to-crypto sol
+  CoinEx --crypto eth 1.5 --to-crypto btc
+  CoinEx --fiat usd 100 --to-fiat twd
+
+Tip: if a coin symbol may be ambiguous, prefer the CoinGecko coin id, such as bitcoin, ethereum, or solana.",
+    group = ArgGroup::new("src")
+        .required(true)
+        .args(&["crypto", "fiat"]),
+    group = ArgGroup::new("dst")
+        .required(true)
+        .args(&["to_crypto", "to_fiat"])
 )]
 struct Cli {
-    /// 來源為「加密貨幣」時指定（id/symbol/name：tia/sol/bitcoin/celestia/solana）
-    #[arg(long, group="src")]
+    /// Source cryptocurrency; accepts a CoinGecko coin id, symbol, or name
+    ///
+    /// Examples: btc, bitcoin, sol, solana, tia, celestia.
+    #[arg(long, group = "src", value_name = "COIN")]
     crypto: Option<String>,
 
-    /// 來源為「法幣/計價幣」時指定（vs 代碼：usd/eur/twd/btc/eth…）
-    #[arg(long, group="src")]
+    /// Source fiat currency or CoinGecko quote currency
+    ///
+    /// Use a CoinGecko supported_vs_currencies code, such as usd, eur, twd, btc, or eth.
+    #[arg(long, group = "src", value_name = "VS_CURRENCY")]
     fiat: Option<String>,
 
-    /// 要換算的數量
+    /// Amount to convert; decimals are supported
+    ///
+    /// Examples: 0.01, 100, 1.5.
+    #[arg(value_name = "AMOUNT")]
     amount: f64,
 
-    /// 目標為「加密貨幣」時指定
-    #[arg(long = "to-crypto", group="dst")]
+    /// Destination cryptocurrency; accepts a CoinGecko coin id, symbol, or name
+    #[arg(long = "to-crypto", group = "dst", value_name = "COIN")]
     to_crypto: Option<String>,
 
-    /// 目標為「法幣/計價幣」時指定
-    #[arg(long = "to-fiat", group="dst")]
+    /// Destination fiat currency or CoinGecko quote currency
+    ///
+    /// Examples: usd, eur, twd, btc, eth.
+    #[arg(long = "to-fiat", group = "dst", value_name = "VS_CURRENCY")]
     to_fiat: Option<String>,
 
-    /// 強制重新下載幣清單快取
-    #[arg(long, action=ArgAction::SetTrue)]
+    /// Ignore the local coin-list cache and download a fresh CoinGecko coin list
+    #[arg(long, action = ArgAction::SetTrue)]
     refresh: bool,
 
-    /// 幣清單快取有效時間（例如：12h、1d；預設：1d）
-    #[arg(long, default_value = "1d")]
+    /// Coin-list cache time-to-live, using humantime syntax
+    ///
+    /// Examples: 30m, 12h, 1d. Defaults to 1d.
+    #[arg(long, default_value = "1d", value_name = "DURATION")]
     cache_ttl: String,
 }
 
@@ -61,7 +84,7 @@ struct CachedCoins {
 
 const COINGECKO_BASE: &str = "https://api.coingecko.com/api/v3";
 
-// 熱門別名 → 正確 CoinGecko id（避免重名誤判）
+// Common aliases mapped to canonical CoinGecko ids to avoid ambiguous-symbol surprises
 fn alias_coin_id(sym_or_id: &str) -> Option<&'static str> {
     match sym_or_id.to_ascii_lowercase().as_str() {
         "tia" => Some("celestia"),
@@ -82,15 +105,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let ttl = humantime::parse_duration(&cli.cache_ttl)
-        .with_context(|| "無法解析 --cache-ttl，範例：12h、1d")?;
+        .with_context(|| "Failed to parse --cache-ttl; examples: 12h, 1d")?;
 
     let client = build_client()?;
 
-    // 準備資料：幣清單 + 可支援的 vs（法幣/部分加密計價）
+    // Prepare data: coin list + supported quote currencies
     let coins = get_or_fetch_coins(&client, cli.refresh, ttl).await?;
     let vs_set = fetch_supported_vs(&client).await.unwrap_or_default();
 
-    // 解析來源與目標
+    // Resolve source and destination assets
     let src = if let Some(sym) = &cli.crypto {
         AssetKind::CoinId(resolve_coin_id_strict(&client, &coins, sym).await?)
     } else {
@@ -107,9 +130,15 @@ async fn main() -> Result<()> {
         AssetKind::VsCurrency(vs)
     };
 
-    // 計算
+    // Convert and print the result
     let value = convert_pair(&client, &src, &dst, cli.amount).await?;
-    println!("{} {} -> {} {}", cli.amount, src.display(), value, dst.display());
+    println!(
+        "{} {} -> {} {}",
+        cli.amount,
+        src.display(),
+        value,
+        dst.display()
+    );
     Ok(())
 }
 
@@ -142,7 +171,8 @@ fn build_client() -> Result<reqwest::Client> {
 }
 
 fn cache_path() -> Result<PathBuf> {
-    let mut p = cache_dir().ok_or_else(|| anyhow!("無法取得系統快取目錄"))?;
+    let mut p =
+        cache_dir().ok_or_else(|| anyhow!("Unable to determine the system cache directory"))?;
     p.push("CoinEx");
     fs::create_dir_all(&p).ok();
     p.push("coins.json");
@@ -185,7 +215,7 @@ async fn fetch_coins_list(client: &reqwest::Client) -> Result<Vec<CoinInfo>> {
     let resp = request_with_retry(client, client.get(&url)).await?;
     let coins: Vec<CoinInfo> = resp.json().await?;
     if coins.is_empty() {
-        return Err(anyhow!("CoinGecko coins/list 回傳為空"));
+        return Err(anyhow!("CoinGecko coins/list returned an empty response"));
     }
     Ok(coins)
 }
@@ -200,7 +230,7 @@ async fn fetch_supported_vs(client: &reqwest::Client) -> Result<std::collections
 fn ensure_vs(vs_set: &std::collections::HashSet<String>, vs: &str) -> Result<()> {
     if !vs_set.contains(vs) {
         return Err(anyhow!(
-            "不支援的法幣/計價代碼：'{}'。可用清單含常見的 usd/eur/twd/btc/eth 等",
+            "Unsupported fiat/quote currency code: '{}'. Common supported codes include usd, eur, twd, btc, and eth",
             vs
         ));
     }
@@ -221,7 +251,7 @@ impl AssetKind {
     }
 }
 
-// 嚴格解析加密貨幣：alias → /search 精確（重名取市值靠前）→ 本地清單精確；不做模糊
+// Strict cryptocurrency resolution: alias -> exact /search match -> exact local-list match; no fuzzy matching
 async fn resolve_coin_id_strict(
     client: &reqwest::Client,
     coins: &[CoinInfo],
@@ -229,7 +259,7 @@ async fn resolve_coin_id_strict(
 ) -> Result<String> {
     let q = s.trim().to_lowercase();
     if q.is_empty() {
-        return Err(anyhow!("幣種不可為空"));
+        return Err(anyhow!("Coin value cannot be empty"));
     }
     if let Some(id) = alias_coin_id(&q) {
         return Ok(id.to_string());
@@ -247,12 +277,12 @@ async fn resolve_coin_id_strict(
         return Ok(c.id.clone());
     }
     Err(anyhow!(
-        "無法識別幣種 '{}'. 請用 id/symbol/name（例：tia/celestia, sol/solana）",
+        "Unable to resolve coin '{}'. Use an id, symbol, or name (examples: tia/celestia, sol/solana)",
         s
     ))
 }
 
-/// 嚴格：只接受精確等於；若 symbol 重名則選市值排名最前
+/// Strict matching only; if symbols collide, prefer the best market-cap rank
 async fn search_coin_id_online_exact(
     client: &reqwest::Client,
     query: &str,
@@ -261,7 +291,11 @@ async fn search_coin_id_online_exact(
     if q.is_empty() {
         return Ok(None);
     }
-    let url = format!("{}/search?query={}", COINGECKO_BASE, urlencoding::encode(&q));
+    let url = format!(
+        "{}/search?query={}",
+        COINGECKO_BASE,
+        urlencoding::encode(&q)
+    );
     let resp = request_with_retry(client, client.get(&url)).await?;
 
     #[derive(Deserialize)]
@@ -286,8 +320,11 @@ async fn search_coin_id_online_exact(
         return Ok(Some(c.id.clone()));
     }
 
-    let mut exact_symbol: Vec<&SearchCoin> =
-        sr.coins.iter().filter(|c| c.symbol.eq_ignore_ascii_case(&q)).collect();
+    let mut exact_symbol: Vec<&SearchCoin> = sr
+        .coins
+        .iter()
+        .filter(|c| c.symbol.eq_ignore_ascii_case(&q))
+        .collect();
     if !exact_symbol.is_empty() {
         exact_symbol.sort_by_key(|c| c.market_cap_rank.unwrap_or(i64::MAX));
         return Ok(Some(exact_symbol[0].id.clone()));
@@ -296,7 +333,7 @@ async fn search_coin_id_online_exact(
     Ok(None)
 }
 
-/// 幣價查詢：回傳 map[coin_id][vs] = price
+/// Price lookup: returns map[coin_id][vs] = price
 async fn fetch_simple_price(
     client: &reqwest::Client,
     ids: &[&str],
@@ -330,7 +367,7 @@ async fn fetch_simple_price(
     Ok(out)
 }
 
-/// 兩點換算：from_kind -> to_kind，回傳折算後金額
+/// Pair conversion: from_kind -> to_kind, returning the converted amount
 async fn convert_pair(
     client: &reqwest::Client,
     from_kind: &AssetKind,
@@ -338,70 +375,71 @@ async fn convert_pair(
     amount: f64,
 ) -> Result<f64> {
     match (from_kind, to_kind) {
-        // 幣→幣：以 USD 作樞紐： rate = price(from,USD)/price(to,USD)
+        // Coin -> coin: use USD as the bridge quote currency.
         (AssetKind::CoinId(from_id), AssetKind::CoinId(to_id)) => {
             let vs = vec!["usd".to_string()];
-            let prices = fetch_simple_price(client, &[from_id.as_str(), to_id.as_str()], &vs).await?;
+            let prices =
+                fetch_simple_price(client, &[from_id.as_str(), to_id.as_str()], &vs).await?;
             let pf = *prices
                 .get(from_id)
                 .and_then(|m| m.get("usd"))
-                .ok_or_else(|| anyhow!("查不到 {} 的 USD 價格", from_id))?;
+                .ok_or_else(|| anyhow!("Unable to find {} USD price", from_id))?;
             let pt = *prices
                 .get(to_id)
                 .and_then(|m| m.get("usd"))
-                .ok_or_else(|| anyhow!("查不到 {} 的 USD 價格", to_id))?;
+                .ok_or_else(|| anyhow!("Unable to find {} USD price", to_id))?;
             Ok(amount * (pf / pt))
         }
-        // 幣→法幣：直接拿 price(from, to_vs)
+        // Coin -> fiat/quote: use price(from, to_vs) directly.
         (AssetKind::CoinId(from_id), AssetKind::VsCurrency(to_vs)) => {
             let prices = fetch_simple_price(client, &[from_id.as_str()], &[to_vs.clone()]).await?;
             let p = *prices
                 .get(from_id)
                 .and_then(|m| m.get(to_vs.as_str()))
-                .ok_or_else(|| anyhow!("查不到 {} 對 {} 的價格", from_id, to_vs))?;
+                .ok_or_else(|| anyhow!("Unable to find {} price in {}", from_id, to_vs))?;
             Ok(amount * p)
         }
-        // 法幣→幣：amount / price(coin, vs)
+        // Fiat/quote -> coin: amount / price(coin, vs).
         (AssetKind::VsCurrency(from_vs), AssetKind::CoinId(to_id)) => {
             let prices = fetch_simple_price(client, &[to_id.as_str()], &[from_vs.clone()]).await?;
             let p = *prices
                 .get(to_id)
                 .and_then(|m| m.get(from_vs.as_str()))
-                .ok_or_else(|| anyhow!("查不到 {} 對 {} 的價格", to_id, from_vs))?;
+                .ok_or_else(|| anyhow!("Unable to find {} price in {}", to_id, from_vs))?;
             Ok(amount / p)
         }
-        // 法幣→法幣：用 BTC 當橋接幣： rate = BTC_to / BTC_from
+        // Fiat/quote -> fiat/quote: use BTC as the bridge asset.
         (AssetKind::VsCurrency(from_vs), AssetKind::VsCurrency(to_vs)) => {
             let bridge = "bitcoin";
             let prices =
                 fetch_simple_price(client, &[bridge], &[from_vs.clone(), to_vs.clone()]).await?;
             let m = prices
                 .get(bridge)
-                .ok_or_else(|| anyhow!("查不到 BTC 的法幣價格"))?;
+                .ok_or_else(|| anyhow!("Unable to find BTC fiat/quote prices"))?;
 
             let k_from = from_vs.to_lowercase();
             let k_to = to_vs.to_lowercase();
 
             let p_from = *m
                 .get(k_from.as_str())
-                .ok_or_else(|| anyhow!("查不到 BTC 對 {} 的價格", from_vs))?;
+                .ok_or_else(|| anyhow!("Unable to find BTC price in {}", from_vs))?;
             let p_to = *m
                 .get(k_to.as_str())
-                .ok_or_else(|| anyhow!("查不到 BTC 對 {} 的價格", to_vs))?;
+                .ok_or_else(|| anyhow!("Unable to find BTC price in {}", to_vs))?;
             Ok(amount * (p_to / p_from))
         }
     }
 }
 
 async fn request_with_retry(
-    _client: &reqwest::Client, // 消除未使用參數警告
+    _client: &reqwest::Client, // Keep the client parameter available for the retry helper signature.
     req: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response> {
     let mut tries = 0usize;
     loop {
         let builder = req
             .try_clone()
-            .ok_or_else(|| anyhow!("request 無法複製（try_clone 失敗）"))?;
+            .ok_or_else(|| anyhow!("request could not be cloned (try_clone failed)"))?;
         match builder.send().await {
             Ok(r) if r.status().is_success() => return Ok(r),
             Ok(r) if r.status().as_u16() == 429 => {
@@ -415,9 +453,9 @@ async fn request_with_retry(
             }
             Err(e) => {
                 if tries >= 4 {
-                    return Err(anyhow!("請求失敗（多次重試後仍失敗）：{}", e));
+                    return Err(anyhow!("request failed after multiple retries: {}", e));
                 }
-                // 指數退避（無外部依賴）
+                // Exponential backoff without additional dependencies
                 let backoff = [400u64, 800, 1600, 3200, 6400][tries.min(4)];
                 sleep(Duration::from_millis(backoff)).await;
             }
@@ -435,26 +473,4 @@ fn retry_after_delay(headers: &HeaderMap) -> Duration {
         }
     }
     Duration::from_secs(2)
-}
-
-fn print_result(
-    coin_id: &str,
-    amount: f64,
-    vs: &[String],
-    prices: &HashMap<String, HashMap<String, f64>>,
-) -> Result<()> {
-    let Some(map) = prices.get(coin_id) else {
-        return Err(anyhow!("查不到 '{}' 的最新價格，請稍後再試", coin_id));
-    };
-
-    println!("幣種: {} | 數量: {}", coin_id, amount);
-    for cur in vs {
-        if let Some(p) = map.get(cur) {
-            let v = amount * p;
-            println!("  = {:>12.6} {}", v, cur.to_uppercase());
-        } else {
-            println!("  (無 {} 報價)", cur.to_uppercase());
-        }
-    }
-    Ok(())
 }
